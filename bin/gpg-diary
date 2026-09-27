@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIARY_DIR="${DIARY_DIRECTORY:-${XDG_DATA_HOME:-$HOME/.local/share}/diary}"
+GPG_KEYID="${DIARY_KEYID:-}"
+EDITOR="${DIARY_EDITOR:-${EDITOR:-nvim}}"
+PAGER="${DIARY_PAGER:-${PAGER:-less}}"
+
+usage() {
+    cat << 'USAGE'
+Usage:
+  gpg-diary add [files...]     Encrypt files or stdin into timestamped entries
+  gpg-diary edit <file.gpg>    Securely decrypt, edit, and re-encrypt an entry
+  gpg-diary read [pattern]     Stream decrypted entries into pager
+  gpg-diary list               List diary entries
+
+Environment Variables:
+  DIARY_KEYID        GPG Recipient Key ID / Fingerprint (Required for encryption)
+  DIARY_DIRECTORY    Directory storing encrypted entries (Default: ~/.local/share/diary)
+  DIARY_EDITOR       Editor for editing (Default: $EDITOR or nvim)
+  DIARY_PAGER        Pager for reading (Default: $PAGER or less)
+USAGE
+    exit 0
+}
+
+require_keyid() {
+    if [[ -z "${GPG_KEYID}" ]]; then
+        echo "[-] Error: DIARY_KEYID is not set. Export it in your environment." >&2
+        exit 1
+    fi
+}
+
+mkdir -p "${DIARY_DIR}"
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+SUBCOMMAND="$1"
+shift
+
+case "${SUBCOMMAND}" in
+    add)
+        require_keyid
+        timestamp="$(date +%Y-%m-%d_%H%M%S)"
+        if [[ $# -gt 0 ]]; then
+            for file in "$@"; do
+                ext="${file##*.}"
+                dest="${DIARY_DIR}/${timestamp}.${ext}.gpg"
+                gpg --output "${dest}" --encrypt --armor --recipient "${GPG_KEYID}" --yes --quiet "${file}"
+                echo "[+] Saved: ${dest}"
+            done
+        else
+            dest="${DIARY_DIR}/${timestamp}.txt.gpg"
+            echo "[*] Reading from stdin (Ctrl+D to finish)..."
+            cat | gpg --output "${dest}" --encrypt --armor --recipient "${GPG_KEYID}" --yes --quiet -
+            echo "[+] Saved: ${dest}"
+        fi
+        ;;
+
+    edit)
+        require_keyid
+        if [[ $# -lt 1 ]]; then
+            echo "[-] Error: Target file required." >&2
+            exit 1
+        fi
+        target="$1"
+        [[ -f "${target}" ]] || target="${DIARY_DIR}/${target}"
+        if [[ ! -f "${target}" ]]; then
+            echo "[-] Error: File not found: ${target}" >&2
+            exit 1
+        fi
+
+        # Secure temp file creation
+        tmp="$(mktemp --tmpdir="${XDG_RUNTIME_DIR:-/tmp}" diary-XXXXXX.txt)"
+        trap 'rm -f "${tmp}"' EXIT INT TERM
+
+        gpg --decrypt --output "${tmp}" --yes --quiet "${target}"
+        "${EDITOR}" "${tmp}"
+        gpg --output "${target}" --encrypt --armor --recipient "${GPG_KEYID}" --yes --quiet "${tmp}"
+        echo "[+] Updated: ${target}"
+        ;;
+
+    read|view)
+        shopt -s nullglob
+        files=("${DIARY_DIR}"/*.gpg)
+        if [[ ${#files[@]} -eq 0 ]]; then
+            echo "[!] No entries found in ${DIARY_DIR}"
+            exit 0
+        fi
+        (
+            for file in "${files[@]}"; do
+                echo "================ $(basename "${file}") ================"
+                gpg --decrypt --output - --yes --quiet "${file}" 2>/dev/null || echo "[Decryption failed]"
+                echo -e "\n"
+            done
+        ) | "${PAGER}"
+        ;;
+
+    list|ls)
+        ls -lh "${DIARY_DIR}"
+        ;;
+
+    -h|--help|help)
+        usage
+        ;;
+
+    *)
+        echo "[-] Unknown command: ${SUBCOMMAND}" >&2
+        usage
+        ;;
+esac
